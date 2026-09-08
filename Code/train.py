@@ -1,5 +1,24 @@
-import tensorflow as tf
 import argparse
+import json
+import os
+import random
+from pathlib import Path
+
+import numpy as np
+
+SEED = 36
+os.environ["PYTHONHASHSEED"] = str(SEED)
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+
+import tensorflow as tf
+
+random.seed(SEED)
+np.random.seed(SEED)
+tf.keras.utils.set_random_seed(SEED)
+try:
+    tf.config.experimental.enable_op_determinism()
+except AttributeError:
+    pass
 
 from data_loader import DataLoader
 from models.models import Model_vault
@@ -29,7 +48,7 @@ parser.add_argument("--downsample", type=int, required=False, default=2,
 parser.add_argument("--timelen", type=int, required=False, default=10,
                     help="Time length of each input signal (MTHS only)")
 parser.add_argument("--batchsize", type=int, required=False, default=80,
-                    help="Batch size (default 80 -- matches BL-PPG bidmc.yaml)")
+                    help="Batch size (default 80 -- matches STAG-HR bidmc.yaml)")
 parser.add_argument("--epochs", type=int, required=False, default=150,
                     help="Number of training epochs (default 150 -- matches BL-PPG bidmc.yaml)")
 parser.add_argument("--testsize", type=float, required=False, default=0.2,
@@ -38,6 +57,16 @@ parser.add_argument("--valsize", type=float, required=False, default=0.15,
                     help="Validation set proportion of train data (MTHS only)")
 parser.add_argument("--savedir", type=str, required=False, default="./",
                     help="Directory to save trained model checkpoints")
+parser.add_argument("--seed", type=int, required=False, default=SEED,
+                    help="Random seed for reproducible model training")
+parser.add_argument("--lr", type=float, required=False, default=3e-3,
+                    help="Initial learning rate")
+parser.add_argument("--weight-decay", type=float, required=False, default=1e-4,
+                    help="AdamW decoupled weight decay")
+parser.add_argument("--lr-factor", type=float, required=False, default=0.5,
+                    help="Factor used when reducing the learning rate")
+parser.add_argument("--lr-patience", type=int, required=False, default=8,
+                    help="Epochs without validation improvement before reducing the learning rate")
 
 # ------------- Parse cml arguments and set config ------------------ #
 args = parser.parse_args()
@@ -50,6 +79,13 @@ VALID_SIZE      = args.valsize
 saving_dir      = args.savedir
 BATCH_SIZE      = args.batchsize
 EPOCHS          = args.epochs
+SEED            = args.seed
+LEARNING_RATE   = args.lr
+WEIGHT_DECAY    = args.weight_decay
+LR_FACTOR       = args.lr_factor
+LR_PATIENCE     = args.lr_patience
+
+MODEL_NAMES = ("BASE", "FCN", "FCN_Residual", "FCN_DCT")
 
 
 if __name__ == "__main__":
@@ -80,43 +116,62 @@ if __name__ == "__main__":
     # Derive sequence length from the loaded data (works for both datasets).
     seq_len = x_train.shape[1]
 
-    # ---- Build model vault and select FCN_Residual only -------------------- #
-    # NOTE: Only FCN_Residual is trained here. Other models (BASE, FCN, FCN_DCT)
-    # are disabled so that MEDVSE and BL-PPG can be compared under identical
-    # conditions with the same model family.
-    model_vault = Model_vault(seq_len, mode=TRAIN_MODE)
-    model = model_vault.create_fcn_residual()
-    model_name = "FCN_Residual"
-
-    # ---- Train with MSE loss (closest to BL-PPG primary criterion) --------- #
     loss = "mean_squared_error"
 
-    print("\nTraining " + model_name + " with loss=" + loss)
-    print("=" * 65)
-
-    checkpoint_path = (
-        saving_dir + "/" + DATASET_NAME + "_" + TRAIN_MODE + "_" + model_name + "_" + loss + ".h5"
+    root = Path(saving_dir)
+    model_builders = (
+        ("BASE", "create_base_model"),
+        ("FCN", "create_fcn"),
+        ("FCN_Residual", "create_fcn_residual"),
+        ("FCN_DCT", "create_fcn_dct"),
     )
-    callback = tf.keras.callbacks.ModelCheckpoint(
-        filepath=checkpoint_path,
-        monitor="val_loss",
-        save_best_only=True,
-        mode="auto",
-    )
+    for model_name, builder_name in model_builders:
+        random.seed(SEED)
+        np.random.seed(SEED)
+        tf.keras.utils.set_random_seed(SEED)
+        model_vault = Model_vault(seq_len, mode=TRAIN_MODE)
+        model = getattr(model_vault, builder_name)()
+        model_dir = root / "checkpoints" / DATASET_NAME / TRAIN_MODE / model_name
+        history_dir = root / "histories" / DATASET_NAME / TRAIN_MODE / model_name
+        model_dir.mkdir(parents=True, exist_ok=True)
+        history_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = model_dir / "best.h5"
 
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss=loss,
-        metrics=["mae"],
-    )
-
-    history = model.fit(
-        x_train, y_train,
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
-        verbose=2,
-        validation_data=(x_valid, y_valid),
-        callbacks=[callback],
-    )
-
-    print("\n[train] Best checkpoint saved to: " + checkpoint_path)
+        print("\nTraining " + model_name + " with loss=" + loss)
+        print("=" * 65)
+        callback = tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(checkpoint_path),
+            monitor="val_loss",
+            save_best_only=True,
+            mode="min",
+        )
+        lr_scheduler = tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=LR_FACTOR,
+            patience=LR_PATIENCE,
+            mode="min",
+            verbose=1,
+        )
+        model.compile(
+            optimizer=tf.keras.optimizers.AdamW(
+                learning_rate=LEARNING_RATE,
+                weight_decay=WEIGHT_DECAY,
+            ),
+            loss=loss,
+            metrics=["mae"],
+        )
+        history = model.fit(
+            x_train, y_train,
+            epochs=EPOCHS,
+            batch_size=BATCH_SIZE,
+            verbose=2,
+            validation_data=(x_valid, y_valid),
+            callbacks=[callback, lr_scheduler],
+        )
+        serializable_history = {
+            key: [float(value) for value in values]
+            for key, values in history.history.items()
+        }
+        with (history_dir / "history.json").open("w", encoding="utf-8") as history_file:
+            json.dump(serializable_history, history_file, indent=2)
+        print("[train] Best checkpoint saved to: " + str(checkpoint_path))

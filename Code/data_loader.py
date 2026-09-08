@@ -5,14 +5,11 @@ from pathlib import Path
 from scipy.signal import butter, filtfilt
 from sklearn.model_selection import train_test_split
 
-_BL_PPG_SPLIT_INFO_PATH = (
-    "/root/projects/BL-PPG-Artifact-Removal/"
-    "pretrained_models/improved_2branch_bidmc/split_info.json"
+_MEDVSE_ROOT = Path(__file__).resolve().parents[1]
+_BIDMC_CSV_PATH = str(
+    _MEDVSE_ROOT / "datasets/bidmc-ppg-and-respiration-dataset-1.0.0/bidmc_csv"
 )
-_BIDMC_CSV_PATH = (
-    "/root/projects/BL-PPG-Artifact-Removal/"
-    "datasets/bidmc-ppg-and-respiration-dataset-1.0.0/bidmc_csv"
-)
+_BIDMC_SPLIT_INFO_PATH = str(_MEDVSE_ROOT / "configs/bidmc_split_info.json")
 
 
 def _bandpass_filter(data, lowcut=0.5, highcut=5.0, fs=125, order=4):
@@ -21,6 +18,20 @@ def _bandpass_filter(data, lowcut=0.5, highcut=5.0, fs=125, order=4):
     high = highcut / nyquist
     b, a = butter(order, [low, high], btype="band")
     return filtfilt(b, a, data)
+
+
+def _resample_to_input_dim(values, input_dim):
+    """Match STAG-HR by linearly resampling each native PPG window."""
+    signal = np.asarray(values, dtype=np.float32).reshape(-1)
+    if signal.size == 0:
+        raise ValueError("Cannot resample an empty PPG window")
+    if signal.size == input_dim:
+        return signal
+    if signal.size == 1:
+        return np.full(input_dim, signal.item(), dtype=np.float32)
+    source_grid = np.linspace(0.0, 1.0, num=signal.size, dtype=np.float32)
+    target_grid = np.linspace(0.0, 1.0, num=input_dim, dtype=np.float32)
+    return np.interp(target_grid, source_grid, signal).astype(np.float32)
 
 
 def _split_subjects(subject_ids, seed=36, val_split=0.2, test_split=0.2):
@@ -40,6 +51,12 @@ def _split_subjects(subject_ids, seed=36, val_split=0.2, test_split=0.2):
     train_subjects = set(shuffled[n_test + n_val:])
     return train_subjects, val_subjects, test_subjects
 
+def _split_subjects_multi_seed(subject_ids, seeds=[36, 42, 99, 300, 900, 1400], val_split=0.2, test_split=0.2):
+    split_results = []
+    for seed in seeds:
+        train, val, test = _split_subjects(subject_ids, seed=seed, val_split=val_split, test_split=test_split)
+        split_results.append((train, val, test))
+    return split_results
 
 def _load_split_info(path):
     if not os.path.exists(path):
@@ -105,9 +122,8 @@ class DataLoader():
 
     def load_bidmc(self, data_path=_BIDMC_CSV_PATH, window_size=16, window_shift=2,
                    sampling_rate=125, eps=1e-8, seed=36, val_split=0.2, test_split=0.2,
-                   split_info_path=_BL_PPG_SPLIT_INFO_PATH, **_ignored):
+                   input_dim=1000, split_info_path=_BIDMC_SPLIT_INFO_PATH, **_ignored):
         data_path = Path(data_path)
-        seq_len = window_size * sampling_rate
         print("[BIDMC] Loading CSVs from " + str(data_path) + " ...")
         subject_records = {}
         for idx in range(1, 54):
@@ -181,16 +197,16 @@ class DataLoader():
             for s in subject_ids:
                 if s in sids and s in all_windows:
                     for ppg_w, hr_l in all_windows[s]:
-                        xs.append(ppg_w)
+                        xs.append(_resample_to_input_dim(ppg_w, input_dim))
                         ys.append(hr_l)
             return np.array(xs, dtype=np.float32), np.array(ys, dtype=np.float32)
 
         x_train, y_train = _collect(train_subjects)
         x_valid, y_valid = _collect(val_subjects)
         x_test,  y_test  = _collect(test_subjects)
-        x_train = x_train.reshape(-1, seq_len, 1)
-        x_valid = x_valid.reshape(-1, seq_len, 1)
-        x_test  = x_test.reshape(-1,  seq_len, 1)
+        x_train = x_train.reshape(-1, input_dim, 1)
+        x_valid = x_valid.reshape(-1, input_dim, 1)
+        x_test  = x_test.reshape(-1, input_dim, 1)
         print("X, y train shapes = ", (x_train.shape, y_train.shape))
         print("X, y valid shapes = ", (x_valid.shape, y_valid.shape))
         print("X, y test shapes = ",  (x_test.shape,  y_test.shape))

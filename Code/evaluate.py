@@ -1,6 +1,8 @@
 import numpy as np
 import tensorflow as tf
 import argparse
+import json
+from pathlib import Path
 
 from data_loader import DataLoader
 
@@ -47,6 +49,8 @@ VALID_SIZE  = args.valsize
 saving_dir  = args.savedir
 BATCH_SIZE  = args.batchsize
 
+MODEL_NAMES = ("BASE", "FCN", "FCN_Residual", "FCN_DCT")
+
 
 def compute_metrics(y_true, y_pred):
     y_true = y_true.ravel().astype(np.float64)
@@ -91,22 +95,33 @@ if __name__ == "__main__":
         print("Wrong dataset name - Please check and try again")
         exit()
 
-    model_name = "FCN_Residual"
     loss_name  = "mean_squared_error"
-    checkpoint_path = (
-        saving_dir + "/" + DATASET_NAME + "_" + TRAIN_MODE + "_" + model_name + "_" + loss_name + ".h5"
-    )
+    root = Path(saving_dir)
+    results_dir = root / "results" / DATASET_NAME / TRAIN_MODE
+    results_dir.mkdir(parents=True, exist_ok=True)
+    all_metrics = {}
 
-    print("\nEvaluating " + model_name + " (loss=" + loss_name + ")")
-    print("-" * 65)
+    for model_name in MODEL_NAMES:
+        checkpoint_path = root / "checkpoints" / DATASET_NAME / TRAIN_MODE / model_name / "best.h5"
+        print("\nEvaluating " + model_name + " (loss=" + loss_name + ")")
+        print("-" * 65)
+        if not checkpoint_path.exists():
+            print("[ERROR] Missing checkpoint: " + str(checkpoint_path))
+            continue
+        try:
+            model = tf.keras.models.load_model(str(checkpoint_path))
+            y_pred = model.predict(x_test, batch_size=BATCH_SIZE, verbose=0).ravel()
+            metrics = compute_metrics(y_test, y_pred)
+        except Exception as e:
+            print("[ERROR] Could not evaluate " + model_name + ": " + str(e))
+            continue
+        all_metrics[model_name] = metrics
+        print_metrics(model_name, metrics)
+        print("-" * 65)
 
-    try:
-        model = tf.keras.models.load_model(checkpoint_path)
-    except Exception as e:
-        print("[ERROR] Could not load model from " + checkpoint_path + ": " + str(e))
-        exit(1)
-
-    y_pred = model.predict(x_test, batch_size=BATCH_SIZE, verbose=0).ravel()
-    metrics = compute_metrics(y_test, y_pred)
-    print_metrics(model_name, metrics)
-    print("-" * 65)
+    results_path = results_dir / "metrics.json"
+    with results_path.open("w", encoding="utf-8") as results_file:
+        json.dump(all_metrics, results_file, indent=2, allow_nan=True)
+    print("\n[evaluate] Metrics saved to: " + str(results_path))
+    if len(all_metrics) != len(MODEL_NAMES):
+        raise SystemExit("[evaluate] Evaluation incomplete: " + str(len(all_metrics)) + "/" + str(len(MODEL_NAMES)) + " models")
